@@ -36,7 +36,8 @@ type RedisReplicationSpec struct {
 type Sentinel struct {
 	common.KubernetesConfig `json:",inline"`
 	common.SentinelConfig   `json:",inline"`
-	Size                    int32 `json:"size"`
+	Size                    int32                   `json:"size"`
+	SecurityContext         *corev1.SecurityContext `json:"securityContext,omitempty"`
 }
 
 func (cr *RedisReplicationSpec) GetReplicationCounts(t string) int32 {

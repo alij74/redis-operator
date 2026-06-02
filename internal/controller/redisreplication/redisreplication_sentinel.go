@@ -87,6 +87,9 @@ func buildSentinelContainer(rr *rrvb2.RedisReplication) corev1.Container {
 	if rr.Spec.Sentinel.Resources != nil {
 		container.Resources = *rr.Spec.Sentinel.Resources
 	}
+	if rr.Spec.Sentinel.SecurityContext != nil {
+		container.SecurityContext = rr.Spec.Sentinel.SecurityContext
+	}
 	return container
 }
 
