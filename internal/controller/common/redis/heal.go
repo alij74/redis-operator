@@ -30,6 +30,7 @@ type Healer interface {
 
 	// UpdatePodRoleLabel connect to all redis pods and update pod role label `redis-role` to `master` or `slave` according to their role.
 	UpdateRedisRoleLabel(ctx context.Context, ns string, labels map[string]string, secret *commonapi.ExistingPasswordSecret, tlsConfig *commonapi.TLSConfig) error
+	UpdateRedisReplicationRoleLabels(ctx context.Context, ns string, labels map[string]string, masterPod string) error
 }
 
 type healer struct {

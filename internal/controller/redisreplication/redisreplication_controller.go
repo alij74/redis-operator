@@ -34,8 +34,11 @@ const (
 type Reconciler struct {
 	client.Client
 	k8sutils.StatefulSet
-	Healer    redishealer.Healer
-	K8sClient kubernetes.Interface
+	Healer                     redishealer.Healer
+	K8sClient                  kubernetes.Interface
+	RedisReplicationTopology   func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error)
+	RedisReplicationRealMaster func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string
+	SentinelMonitoredMaster    func(context.Context, *rrvb2.RedisReplication, []string) (string, error)
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -240,17 +243,9 @@ func (r *Reconciler) configureSentinelPod(
 	masterAddr string,
 	masterPassword string,
 ) error {
-	var sentinelPassword string
-	if inst.Spec.Sentinel.ExistingPasswordSecret != nil {
-		secret, err := r.K8sClient.CoreV1().Secrets(inst.Namespace).Get(
-			ctx,
-			*inst.Spec.Sentinel.ExistingPasswordSecret.Name,
-			metav1.GetOptions{},
-		)
-		if err != nil {
-			return err
-		}
-		sentinelPassword = string(secret.Data[*inst.Spec.Sentinel.ExistingPasswordSecret.Key])
+	sentinelPassword, err := r.sentinelPassword(ctx, inst)
+	if err != nil {
+		return err
 	}
 
 	sentinelConnInfo := &redis.ConnectionInfo{
@@ -346,27 +341,28 @@ func (r *Reconciler) sentinelResetIfNeed(ctx context.Context, inst *rrvb2.RedisR
 
 func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
 	if instance.EnableSentinel() {
-		if !r.IsStatefulSetReady(ctx, instance.Namespace, instance.SentinelStatefulSet()) {
-			return intctrlutil.RequeueAfter(ctx, time.Second*30, "waiting for sentinel statefulset to be ready")
-		}
-		if !r.IsStatefulSetReady(ctx, instance.Namespace, instance.RedisStatefulSet()) {
-			return intctrlutil.RequeueAfter(ctx, time.Second*30, "waiting for redis statefulset to be ready")
+		if !r.IsStatefulSetReady(ctx, instance.Namespace, instance.SentinelStatefulSet()) ||
+			!r.IsStatefulSetReady(ctx, instance.Namespace, instance.RedisStatefulSet()) {
+			log.FromContext(ctx).Info("Skipping replication setup until the redis and sentinel statefulsets are ready")
+			return intctrlutil.Reconciled()
 		}
 	}
 
+	topology, err := r.redisReplicationTopology(ctx, instance)
+	if err != nil {
+		return intctrlutil.RequeueE(ctx, err, "")
+	}
+	if !topology.Complete() {
+		log.FromContext(ctx).Info("Skipping replication setup until every redis pod answers", "unobserved", topology.Unobserved)
+		return intctrlutil.Reconciled()
+	}
+	masterNodes, slaveNodes := topology.Masters, topology.Slaves
+
 	var realMaster string
-	masterNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "master")
-	if err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
-	}
-	slaveNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "slave")
-	if err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
-	}
 	if len(masterNodes) > 1 {
 		log.FromContext(ctx).Info("Creating redis replication by executing replication creation commands")
 
-		realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, instance, masterNodes)
+		realMaster = r.redisReplicationRealMaster(ctx, instance, masterNodes)
 		if len(slaveNodes) == 0 {
 			realMaster = masterNodes[0]
 		}
@@ -375,7 +371,7 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 		}
 	} else if len(masterNodes) == 1 && len(slaveNodes) > 0 {
 		realMaster = masterNodes[0]
-		currentRealMaster := k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, instance, masterNodes)
+		currentRealMaster := r.redisReplicationRealMaster(ctx, instance, masterNodes)
 
 		if currentRealMaster == "" && !instance.EnableSentinel() {
 			log.FromContext(ctx).Info("Detected disconnected slaves, reconfiguring replication",
@@ -410,31 +406,28 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 
 // reconcileStatus update status and label.
 func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
-	var err error
-	var realMaster string
-
-	masterNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "master")
+	topology, err := r.redisReplicationTopology(ctx, instance)
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
-	realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, instance, masterNodes)
+	realMaster := r.identifyMaster(ctx, instance, topology)
+	if realMaster == "" {
+		if topology.Complete() {
+			if err = r.UpdateRedisReplicationMaster(ctx, instance, ""); err != nil {
+				return intctrlutil.RequeueE(ctx, err, "")
+			}
+		}
+		monitoring.RedisReplicationConnectedSlavesTotal.WithLabelValues(instance.Namespace, instance.Name).Set(float64(0))
+		return intctrlutil.RequeueAfter(ctx, time.Second*5, "no redis master identified")
+	}
+	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
+	if err = r.Healer.UpdateRedisReplicationRoleLabels(ctx, instance.GetNamespace(), labels, realMaster); err != nil {
+		return intctrlutil.RequeueE(ctx, err, "")
+	}
 	if err = r.UpdateRedisReplicationMaster(ctx, instance, realMaster); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
-	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
-	if err = r.Healer.UpdateRedisRoleLabel(ctx, instance.GetNamespace(), labels, instance.Spec.KubernetesConfig.ExistingPasswordSecret, instance.Spec.TLS); err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
-	}
-
-	slaveNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "slave")
-	if err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
-	}
-	if realMaster != "" {
-		monitoring.RedisReplicationConnectedSlavesTotal.WithLabelValues(instance.Namespace, instance.Name).Set(float64(len(slaveNodes)))
-	} else {
-		monitoring.RedisReplicationConnectedSlavesTotal.WithLabelValues(instance.Namespace, instance.Name).Set(float64(0))
-	}
+	monitoring.RedisReplicationConnectedSlavesTotal.WithLabelValues(instance.Namespace, instance.Name).Set(float64(len(topology.Slaves)))
 
 	return intctrlutil.Reconciled()
 }
